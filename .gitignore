@@ -130,3 +130,5 @@ dmypy.json
 
 # Parquet dataset
 data_archive
+
+all_pairs
