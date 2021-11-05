@@ -7,3 +7,4 @@ Grabs and updates all historical data on all crypto.
 - [ ] Use async binance calls
 - [ ] Double check parquet timestamps from original data
 - [ ] Use websockets for listening to new klines
+- [ ] Catch any exceptions. Maybe binance exceptions.
