@@ -3,9 +3,11 @@ import os.path
 import logging
 import json
 import time
+import math
 from os import listdir
 from binance.client import Client
 from binance.exceptions import BinanceRequestException, BinanceAPIException
+import concurrent.futures
 
 
 class CryptoDatasetManager():
@@ -89,25 +91,44 @@ class CryptoDatasetManager():
         filepath = f"./{self.PARQUETFOLDERNAME}/{filename}"
         df.to_parquet(filepath, index=False)
 
-    def update_data(self, pairs=None):
-        "Update parquet files with new data. Defaults to updating all symbol pairs unless given list of specified pairs."
+    def update_data(self, pairs=None, threads=6):
+        """Update parquet files with new data. Defaults to updating all symbol pairs unless given list of specified pairs.
+        Splits data into parts to update seperately on different threads. Default 6 threads.
+        """
         if pairs == None:
             pairs = self.symbol_pairs
+        batches = self.split_batches(pairs, threads)
+        with concurrent.futures.ThreadPoolExecutor(max_workers=threads) as exec:
+            for batch in batches:
+                exec.submit(self._batch_update, batch)
+
+    def split_batches(self, list, batch_size):
+        "Splits list into list of list and returns it."
+        llen = len(list)
+        pairs_batch_size = int(math.ceil(llen/batch_size))
+        pair_batches = [list[n:n+pairs_batch_size]
+                        for n in range(0, llen, pairs_batch_size)]
+        return pair_batches
+
+    def _batch_update(self, pairs):
+        "Updates a batch of symbol pairs. Returns True when whole batch is done."
         for pair in pairs:
             sym = f"{pair[0]}{pair[1]}"
             symbol_pair_df = self._get_saved_parquet(pair)
             last_timestamp = self._grab_max_time(symbol_pair_df)
-            # Get current time in seconds. Convert to milli and subtract 5 minutes
-            current_timestamp = time.time() * 1000 - 300000
+            # Get current time in seconds. Convert to milli and subtract 10 minutes
+            current_timestamp = time.time() * 1000 - 600000
 
-            counter = 0
+            counter = 1
             while int(last_timestamp) < current_timestamp:
                 logging.debug(
-                    f"Updating: {sym} | Latest timestamp: {last_timestamp}")
+                    f"Updating: {sym} | Latest T: {last_timestamp} | Current T: {current_timestamp}")
 
                 # Request from binance
                 try:
                     new_data = self._get_klines(sym, last_timestamp)
+                    if new_data.empty:
+                        break
                 except BinanceAPIException as e:
                     print(e)
                 except BinanceRequestException as e:
@@ -115,11 +136,12 @@ class CryptoDatasetManager():
                 finally:
                     symbol_pair_df = symbol_pair_df.append(new_data)
                     last_timestamp = self._grab_max_time(symbol_pair_df)
-                    # Write to file every five cycles
-                    if counter == 5:
+                    # Write to file every fifty cycles
+                    if counter == 50:
                         counter = 0
                         self._write_parquet(pair, symbol_pair_df)
                     counter += 1
+        return True
 
     def _grab_max_time(self, df):
         "Return max open timestamp of or a default start date of 01/01/1990."
@@ -146,7 +168,7 @@ class CryptoDatasetManager():
 def main():
     logging.basicConfig(level=logging.DEBUG)
     dataset_manager = CryptoDatasetManager()
-    dataset_manager.update_data([("BTC", "USDT")])
+    dataset_manager.update_data()
 
 
 if __name__ == "__main__":
