@@ -27,7 +27,11 @@ class CryptoDatasetManager():
         pa_schema = pa.schema(pa_field)
         self.PA_SCHEMA = pa_schema
         # Start binance client
-        self.binance_client = Client()
+        try:
+            self.binance_client = Client()
+        except BinanceAPIException(e):
+            logging.debug(f"Unable to connect to Binance servers.")
+            logging.debug(e)
 
         self.PARQUETFOLDERNAME = foldername
         self.symbol_pairs = self.get_existing_symbol_pairs()
@@ -82,7 +86,7 @@ class CryptoDatasetManager():
         filepath = f"./{self.PARQUETFOLDERNAME}/{filename}"
         pq.write_table(pa_tb, filepath, coerce_timestamps=timestamp)
 
-    def update_data(self, pairs=None, threads=6, counter_limit=50):
+    def update_data(self, pairs=None, threads=6, counter_limit=50, sleep_time=120):
         """Update parquet files with new data. Defaults to updating all symbol pairs unless given list of specified pairs.
         Splits data into parts to update seperately on different threads. Default 6 threads.
         """
@@ -91,7 +95,8 @@ class CryptoDatasetManager():
         batches = self.split_batches(pairs, threads)
         with concurrent.futures.ThreadPoolExecutor(max_workers=threads) as exec:
             for batch in batches:
-                exec.submit(self._batch_update, batch, counter_limit)
+                exec.submit(self._batch_update, batch,
+                            counter_limit, sleep_time)
 
     def split_batches(self, list, batch_size):
         "Splits list into list of list and returns it."
@@ -101,7 +106,7 @@ class CryptoDatasetManager():
                         for n in range(0, llen, pairs_batch_size)]
         return pair_batches
 
-    def _batch_update(self, pairs, counter_limit):
+    def _batch_update(self, pairs, counter_limit, sleep_time):
         "Updates a batch of symbol pairs. Returns True when whole batch is done."
         for pair in pairs:
             sym = f"{pair[0]}{pair[1]}"
@@ -122,10 +127,13 @@ class CryptoDatasetManager():
                         logging.info(
                             f"Breaking out of loop. Done getting data for {sym}.")
                         break
-                except BinanceAPIException as e:
-                    logging.debug(e)
+                # Wait if exception is raised. Prob due to request speed.
                 except BinanceRequestException as e:
                     logging.debug(e)
+                    time.sleep(sleep_time)
+                except BinanceAPIException as e:
+                    logging.debug(e)
+                    time.sleep(sleep_time)
                 finally:
                     symbol_pair_pa_tb = pa.concat_tables(
                         [symbol_pair_pa_tb, new_data])
@@ -195,7 +203,8 @@ class CryptoDatasetManager():
 def main():
     logging.basicConfig(level=logging.DEBUG)
     dataset_manager = CryptoDatasetManager()
-    dataset_manager.update_data(threads=10)
+    dataset_manager.update_symbol_pairs()
+    dataset_manager.update_data(threads=3)
 
 
 if __name__ == "__main__":
