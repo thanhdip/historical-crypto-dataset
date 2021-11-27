@@ -1,6 +1,3 @@
-import pandas as pd
-from pyarrow import compute
-from pyarrow.ipc import new_file
 import pyarrow.parquet as pq
 import pyarrow as pa
 import os.path
@@ -8,54 +5,35 @@ import logging
 import json
 import time
 import math
+import concurrent.futures
 from os import listdir
 from os import remove
 from binance.client import Client
 from binance.exceptions import BinanceRequestException, BinanceAPIException
-import concurrent.futures
 
 
 class CryptoDatasetManager():
-    PARQUETFOLDERNAME = "data_archive"
-    LABELS = [
-        'open_time',
-        'open',
-        'high',
-        'low',
-        'close',
-        'volume',
-        'close_time',
-        'quote_asset_volume',
-        'number_of_trades',
-        'taker_buy_base_asset_volume',
-        'taker_buy_quote_asset_volume',
-        'ignore'
-    ]
 
-    DATATYPES = {
-        'open_time': 'datetime64[ms]',
-        'open': 'float32',
-        'high': 'float32',
-        'low': 'float32',
-        'close': 'float32',
-        'volume': 'float32',
-        'close_time': 'datetime64[ms]',
-        'quote_asset_volume': 'float32',
-        'number_of_trades': 'int64',
-        'taker_buy_base_asset_volume': 'float32',
-        'taker_buy_quote_asset_volume': 'float32',
-        'ignore': 'float64'
-    }
+    PA_TYPES = [pa.timestamp("ms"), pa.float32(), pa.float32(), pa.float32(), pa.float32(), pa.float32(),
+                pa.timestamp("ms"), pa.float32(), pa.uint16(), pa.float32(), pa.float32(), pa.float32()]
 
-    def __init__(self, foldername=PARQUETFOLDERNAME, con_max_size=20):
-        # Set conneciton pool max size
-        # self._http_connection_pool_inject(maxsize=con_max_size)
-        # Start binance clietn
+    PA_NAMES = ["open_time", "open", "high", "low", "close", "volume", "close_time", "quote_asset_volume",
+                "number_of_trades", "taker_buy_base_asset_volume", "taker_buy_quote_asset_volume", "ignore"]
+
+    def __init__(self, foldername="data_archive", con_max_size=20):
+        # Prep pyarrow schema
+        pa_field = [pa.field(g[0], g[1])
+                    for g in zip(self.PA_NAMES, self.PA_TYPES)]
+        pa_schema = pa.schema(pa_field)
+        self.PA_SCHEMA = pa_schema
+        # Start binance client
         self.binance_client = Client()
+
         self.PARQUETFOLDERNAME = foldername
-        self.get_existing_symbol_pairs()
+        self.symbol_pairs = self.get_existing_symbol_pairs()
 
     def save_metadata(self):
+        "Save metadata as a json."
         filename = "metadata.json"
         filepath = f"./{self.PARQUETFOLDERNAME}/{filename}"
         with open(filepath) as metadatafile:
@@ -68,10 +46,10 @@ class CryptoDatasetManager():
         filepath = f"./{self.PARQUETFOLDERNAME}"
         all_symbol_pairs = [(os.path.splitext(f)[0].split("-")[0], os.path.splitext(f)[0].split("-")[1])
                             for f in listdir(filepath) if os.path.isfile(os.path.join(filepath, f))]
-        self.symbol_pairs = all_symbol_pairs
+        return all_symbol_pairs
 
     def update_symbol_pairs(self):
-        "Gets exchange info from Binance and sets a list of symbol pairs as tuples. Accessed by self.symbol_pairs"
+        "Gets exchange info from Binance and sets a list of symbol pairs as tuples. Accessed by self.symbol_pairs."
         SYMBOLS = "symbols"
         BASEASSET = "baseAsset"
         QUOTEASSET = "quoteAsset"
@@ -92,11 +70,8 @@ class CryptoDatasetManager():
             except:
                 # Unable to read file, probably corrupted. Delete file.
                 remove(filepath)
-        # Create empty and return if can't read file.
-        df = pd.DataFrame(columns=self.LABELS)
-        df = df.astype(self.DATATYPES)
-        df.drop(['close_time', 'ignore'], axis=1, inplace=True)
-        tb = pa.Table.from_pandas(df,  preserve_index=False)
+        # Create empty pa table.
+        tb = self._to_pa_table([])
         self._write_parquet(sym_pair, tb, timestamp="ms")
         return tb
 
@@ -178,28 +153,36 @@ class CryptoDatasetManager():
         # Request
         response = self.binance_client.get_klines(
             symbol=sym, interval=Client.KLINE_INTERVAL_1MINUTE, limit=1000, startTime=start)
-        updatedPart = pd.DataFrame(response, columns=self.LABELS)
         # convert to pyarrow table and return.
-        return self._clean_dataframe(updatedPart)
+        return self._to_pa_table(response)
 
-    def _clean_dataframe(self, df):
-        "Clean dataframe and return a pyarrow table."
-        pa_schema = pa.schema([
-            pa.field("open_time", pa.timestamp("ms")),
-            pa.field("open", pa.float32()),
-            pa.field("high", pa.float32()),
-            pa.field("low", pa.float32()),
-            pa.field("close", pa.float32()),
-            pa.field("volume", pa.float32()),
-            pa.field("quote_asset_volume", pa.float32()),
-            pa.field("number_of_trades", pa.uint16()),
-            pa.field("taker_buy_base_asset_volume", pa.float32()),
-            pa.field("taker_buy_quote_asset_volume", pa.float32()),
-        ])
-        df = df.astype(self.DATATYPES)
-        df.drop(['close_time', 'ignore'], axis=1, inplace=True)
-        tb = pa.Table.from_pandas(df, preserve_index=False)
-        return tb.cast(pa_schema)
+    def _to_pa_table(self, response_list):
+        "Clean response data and return a pyarrow table."
+        if response_list == []:
+            ret = pa.table(
+                [[] for _ in range(0, len(self.PA_SCHEMA))], schema=self.PA_SCHEMA)
+            return self._clean_table(ret)
+
+        # Create pyarrow array of columns from rows
+        list_of_cols = self._transpose_list(response_list)
+        pa_cols = [pa.array([float(data) for data in list_of_cols[n]], self.PA_TYPES[n])
+                   for n in range(0, len(self.PA_TYPES))]
+        # Create pyarrow table
+        pa_table = pa.table(pa_cols, schema=self.PA_SCHEMA)
+        # Drop unneccesary columns.
+        return self._clean_table(pa_table)
+
+    def _clean_table(self, table):
+        "Clean table of uneccesary columns and return new table."
+        try:
+            table = table.drop(["close_time", "ignore"])
+        except:
+            pass
+        return table
+
+    def _transpose_list(self, ll):
+        "Given a list of list, transpose the list. I.e list of rows turns to a list of columns."
+        return [list(row) for row in zip(*ll)]
 
     def delete_sym_pair(self, sym_pair):
         "Delete sym pair file."
@@ -207,29 +190,6 @@ class CryptoDatasetManager():
         filepath = f"./{self.PARQUETFOLDERNAME}/{filename}"
         logging.info(f"Deleting file for {sym_pair}")
         remove(filepath)
-
-    def _get_klines_rf(self, symbol, interval, limit, startTime):
-        "Sends a kline request directly using requests instead of binance package."
-        pass
-
-    def _http_connection_pool_inject(self, **constructor_kwargs):
-        """
-        Changed urllib3's connectionpool default params for when the connection cannot be changed.
-        Arguments are same as would be for class urllib3.HTTPConnectionPool
-
-        RUN BEFORE ANY CONNECTION IS MADE.
-        Usage:
-        patch_http_connection_pool(maxsize=16)
-        """
-        from urllib3 import connectionpool, poolmanager
-
-        class HTTPConnectionPoolInject(connectionpool.HTTPConnectionPool):
-            def __init__(self, *args, **kwargs):
-                kwargs.update(constructor_kwargs)
-                super(HTTPConnectionPoolInject, self).__init__(*args, **kwargs)
-
-        poolmanager.pool_classes_by_scheme['http'] = HTTPConnectionPoolInject
-        poolmanager.pool_classes_by_scheme['https'] = HTTPConnectionPoolInject
 
 
 def main():
